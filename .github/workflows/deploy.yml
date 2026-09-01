@@ -1,0 +1,164 @@
+name: CI/CD - Build and Deploy to ECS Fargate
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+env:
+  AWS_REGION: ap-northeast-1
+  ECR_REPOSITORY: aws-todo-app
+  ECS_CLUSTER: todo-cluster
+  ECS_SERVICE: todo-app-service
+  CONTAINER_NAME: todo-app
+
+permissions:
+  contents: read
+  id-token: write   # Required for OIDC authentication with AWS
+
+jobs:
+  # ---------------------------------------------------------------
+  # Job 1: CI – Lint, type check, build
+  # Runs on every push and pull_request to main
+  # ---------------------------------------------------------------
+  ci:
+    name: CI (lint + type-check + build)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Type check
+        run: npm run type-check
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build Next.js app
+        run: npm run build
+        env:
+          # Dummy DATABASE_URL for build-time type checking only
+          DATABASE_URL: "postgresql://user:pass@localhost:5432/tododb"
+
+  # ---------------------------------------------------------------
+  # Job 2: CD – Build Docker image, push to ECR, deploy to ECS
+  # Runs only on push to main (not pull requests)
+  # ---------------------------------------------------------------
+  deploy:
+    name: CD (Docker build → ECR push → ECS deploy)
+    needs: ci
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Authenticate to AWS using OIDC (no long-lived access keys)
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-TodoApp-Deploy
+
+      # Log in to Amazon ECR
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Build, tag, and push image to ECR
+      - name: Build, tag, and push Docker image to ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          # Build with both the commit SHA tag and "latest" tag
+          docker build \
+            --tag "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" \
+            --tag "$ECR_REGISTRY/$ECR_REPOSITORY:latest" \
+            --cache-from "$ECR_REGISTRY/$ECR_REPOSITORY:latest" \
+            --build-arg BUILDKIT_INLINE_CACHE=1 \
+            .
+
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
+      # Fetch the current ECS task definition
+      - name: Download current ECS task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition todo-app \
+            --query taskDefinition \
+            > task-def.json
+
+      # Update the task definition with the new image
+      - name: Update ECS task definition with new image
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-def.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.build-image.outputs.image }}
+
+      # Deploy the new task definition to ECS
+      - name: Deploy to Amazon ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+          wait-for-minutes: 10
+
+      - name: Print deployment summary
+        run: |
+          echo "✅ Deployment complete!"
+          echo "   Image: ${{ steps.build-image.outputs.image }}"
+          echo "   Cluster: ${{ env.ECS_CLUSTER }}"
+          echo "   Service: ${{ env.ECS_SERVICE }}"
+
+      # ALB なし構成: タスクのパブリック IP を取得してアクセス URL を表示
+      - name: Get ECS task public IP
+        run: |
+          TASK_ARN=$(aws ecs list-tasks \
+            --cluster "$ECS_CLUSTER" \
+            --service-name "$ECS_SERVICE" \
+            --query "taskArns[0]" \
+            --output text \
+            --region "$AWS_REGION")
+
+          ENI_ID=$(aws ecs describe-tasks \
+            --cluster "$ECS_CLUSTER" \
+            --tasks "$TASK_ARN" \
+            --query "tasks[0].attachments[0].details[?name=='networkInterfaceId'].value" \
+            --output text \
+            --region "$AWS_REGION")
+
+          PUBLIC_IP=$(aws ec2 describe-network-interfaces \
+            --network-interface-ids "$ENI_ID" \
+            --query "NetworkInterfaces[0].Association.PublicIp" \
+            --output text \
+            --region "$AWS_REGION")
+
+          echo "🌐 App URL: http://$PUBLIC_IP:3000"
+          echo "   ※ タスク再起動ごとに IP が変わります"
